@@ -43,7 +43,10 @@ fn main() {
         match ipc::monitors() {
             Ok(monitors) => {
                 let selected = rules::select_monitors(&monitors, output.as_deref(), &filters);
-                if !selected.names.is_empty() {
+                // At login the chosen screens can come up after others: wait for them before falling back
+                // (10-20: two docks stacked on an ARZOPA when the ultrawides were late).
+                let early = selected.fallback && !filters.is_empty() && Instant::now() < deadline;
+                if !selected.names.is_empty() && !early {
                     if selected.fallback {
                         let reason = if filters.is_empty() { "SCREENS unset or empty" } else { "no SCREENS match" };
                         log(&format!("{reason}; falling back to {}", selected.names[0]));
