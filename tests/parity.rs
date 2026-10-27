@@ -160,6 +160,11 @@ fn desktop_matching_isolated() {
         assert_eq!(terminal.name(), "Terminal");
         assert_eq!(terminal.icon().unwrap().to_string().as_deref(), Some("org.gnome.Ptyxis"));
         assert!(desktop::app_info("no-such-fixture-app").is_none());
+        // A changed desktop file stays cached until the application monitor invalidates it.
+        fs::write(firefox.filename().unwrap(), "[Desktop Entry]\nType=Application\nName=Firefox Updated\nIcon=firefox\nExec=firefox %u\n").unwrap();
+        assert_eq!(desktop::app_info("firefox").unwrap().name(), "Firefox");
+        desktop::invalidate();
+        assert_eq!(desktop::app_info("firefox").unwrap().name(), "Firefox Updated");
         return;
     }
     let scratch = Scratch::new();
