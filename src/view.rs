@@ -49,14 +49,32 @@ mod imp {
             });
             (size, size, -1, -1)
         }
+        fn size_allocate(&self, _: i32, _: i32, _: i32) {
+            let scene = self.scene.borrow();
+            let Some(scene) = scene.as_ref() else { return; };
+            allocate_style(self.bar_style.borrow().as_ref().unwrap(), scene.layout.bar);
+            let active = self.active_style.borrow();
+            let active = active.as_ref().unwrap();
+            let icon = scene.icons.iter().zip(&scene.layout.icons).find(|(icon, _)| icon.active);
+            active.set_child_visible(icon.is_some());
+            if let Some((_, rect)) = icon {
+                allocate_style(active, motion::Rect {
+                    x: rect.x + rect.width / 2.0 - 10.0, y: scene.indicator_y + 4.0,
+                    width: 20.0, height: 3.0,
+                });
+            }
+            let mut child = self.obj().first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                if let Some(menu) = widget.downcast_ref::<gtk::Popover>() { menu.present(); }
+            }
+        }
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             let scene = self.scene.borrow();
             let Some(scene) = scene.as_ref() else { return; };
             let styles = self.bar_style.borrow();
             let bar = styles.as_ref().unwrap();
-            let rect = scene.layout.bar;
-            snapshot.render_background(&bar.style_context(), rect.x, rect.y, rect.width, rect.height);
-            snapshot.render_frame(&bar.style_context(), rect.x, rect.y, rect.width, rect.height);
+            self.obj().snapshot_child(bar, snapshot);
             for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
                 snapshot.save();
                 if icon.shadow {
@@ -85,14 +103,20 @@ mod imp {
                     if icon.indicator == rules::Indicator::Hollow { cr.set_line_width(1.2); let _ = cr.stroke(); }
                     else { let _ = cr.fill(); }
                 }
-                if icon.active {
-                    let style = self.active_style.borrow();
-                    snapshot.render_frame(&style.as_ref().unwrap().style_context(),
-                        centre - 10.0, scene.indicator_y + 4.0, 20.0, 3.0);
-                }
             }
+            self.obj().snapshot_child(self.active_style.borrow().as_ref().unwrap(), snapshot);
         }
     }
+}
+
+// GTK 4's widget snapshot paints CSS backgrounds and borders without style contexts.
+fn allocate_style(widget: &gtk::Box, rect: motion::Rect) {
+    let width = rect.width.ceil().max(1.0) as i32;
+    let height = rect.height.ceil().max(1.0) as i32;
+    let transform = gtk::gsk::Transform::new()
+        .translate(&gtk::graphene::Point::new(rect.x as f32, rect.y as f32))
+        .scale(rect.width as f32 / width as f32, rect.height as f32 / height as f32);
+    widget.allocate(width, height, -1, Some(transform));
 }
 
 glib::wrapper! {
@@ -107,6 +131,8 @@ impl DockView {
         view.set_overflow(gtk::Overflow::Visible);
         let bar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         bar.add_css_class("dock-bar");
+        bar.set_can_target(false);
+        bar.set_parent(&view);
         let indicator = gtk::Label::new(None);
         indicator.add_css_class("dock-indicator");
         *view.imp().bar_style.borrow_mut() = Some(bar);
@@ -114,6 +140,9 @@ impl DockView {
         let active = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         active.add_css_class("dock-item");
         active.add_css_class("active");
+        active.set_can_target(false);
+        active.set_child_visible(false);
+        active.set_parent(&view);
         *view.imp().active_style.borrow_mut() = Some(active);
         view
     }
@@ -136,7 +165,7 @@ impl DockView {
             surface.set_input_region(&region);
         }
         *self.imp().scene.borrow_mut() = Some(scene);
-        if resize { self.queue_resize(); }
+        if resize { self.queue_resize(); } else { self.queue_allocate(); }
         self.queue_draw();
     }
 }
