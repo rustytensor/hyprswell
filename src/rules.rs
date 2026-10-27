@@ -108,6 +108,11 @@ pub fn drawn_size(size: u32, count: usize) -> u32 {
     (drawn * 6 / divisor as u64).min(u64::from(u32::MAX)) as u32
 }
 
+// Reserve the full swell size before GTK rasterizes or chooses a bitmap.
+pub fn icon_lookup_size(drawn: u32) -> i32 {
+    (u64::from(drawn) * 8).div_ceil(5).min(i32::MAX as u64) as i32
+}
+
 pub fn select_monitors(monitors: &[Monitor], output: Option<&str>) -> Vec<String> {
     monitors.iter().filter(|m| match output {
         Some(name) => m.name == name,

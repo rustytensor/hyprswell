@@ -125,6 +125,18 @@ fn icon_configuration_and_integer_shrink() {
 }
 
 #[test]
+fn icon_lookup_covers_swell() {
+    // Six apps do not shrink. 44*5/4=55, then ceil(55*8/5)=88.
+    let drawn = rules::drawn_size(44, 6);
+    assert_eq!(drawn, 55);
+    assert_eq!(rules::icon_lookup_size(drawn), 88);
+    // 48*5/4=60, then ceil(60*8/5)=96. These are source lookup sizes.
+    let drawn = rules::drawn_size(48, 6);
+    assert_eq!(drawn, 60);
+    assert_eq!(rules::icon_lookup_size(drawn), 96);
+}
+
+#[test]
 fn screens_match_model_not_port() {
     let monitors: Vec<Monitor> = serde_json::from_str(r#"[
         {"name":"DP-2","description":"GWD ARZOPA 0x37330206"},

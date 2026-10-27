@@ -198,18 +198,19 @@ fn refresh(state: &Shared) {
     s.size = size;
     if rebuild {
         s.refresh_icons = false;
-        let drawn = rules::drawn_size(size, s.items.len().saturating_sub(1)).max(1) as i32;
+        let drawn = rules::drawn_size(size, s.items.len().saturating_sub(1)).max(1);
+        let lookup = rules::icon_lookup_size(drawn);
         let icons: Vec<_> = s.items.iter().map(|item| {
             let display = s.docks[0].view.display();
             let theme = gtk::IconTheme::for_display(&display);
             let scale = s.docks[0].view.scale_factor();
             let info = if item.id == "launcher" { None } else { desktop::app_info(&item.id) };
             let paintable = if let Some(icon) = info.and_then(|a| a.icon()) {
-                theme.lookup_by_gicon(&icon, drawn, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
+                theme.lookup_by_gicon(&icon, lookup, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
             } else {
                 let name = if item.id == "launcher" { "view-app-grid-symbolic" }
                     else if theme.has_icon(&item.id) { &item.id } else { "image-missing" };
-                theme.lookup_icon(name, &[], drawn, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
+                theme.lookup_icon(name, &[], lookup, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
             };
             Icon { paintable: paintable.upcast(), indicator: rules::indicator(&item.windows),
                 active: item.windows.iter().any(|c| c.address == s.snapshot.active), shadow: false, bounce: 0.0 }
