@@ -54,15 +54,18 @@ fn refresh_event(line: &str) -> bool {
 }
 
 // The worker owns all socket reads; GTK only drains completed snapshots.
-pub fn updates() -> Receiver<Result<Snapshot, String>> {
+pub fn updates() -> io::Result<(Receiver<Result<Snapshot, String>>, UnixStream)> {
     let (send, receive) = mpsc::sync_channel(1);
+    let (mut notify, signal) = UnixStream::pair()?;
+    signal.set_nonblocking(true)?;
     std::thread::spawn(move || {
+        let mut deliver = |value| send.send(value).is_ok() && notify.write_all(b".").is_ok();
         loop {
             let connection = socket(".socket2.sock").and_then(UnixStream::connect);
             let stream = match connection {
                 Ok(stream) => stream,
                 Err(error) => {
-                    if send.send(Err(format!("event socket: {error}"))).is_err() { return; }
+                    if !deliver(Err(format!("event socket: {error}"))) { return; }
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -89,16 +92,16 @@ pub fn updates() -> Receiver<Result<Snapshot, String>> {
                 }
                 while pending.try_recv().is_ok() {}
                 let result = snapshot().map_err(|error| format!("refresh: {error}"));
-                if send.send(result).is_err() { return; }
+                if !deliver(result) { return; }
                 last = Instant::now();
                 if pending.recv().is_err() { break; }
             }
             let _ = reader.join();
-            if send.send(Err("event socket disconnected; reconnecting".into())).is_err() { return; }
+            if !deliver(Err("event socket disconnected; reconnecting".into())) { return; }
             std::thread::sleep(Duration::from_secs(1));
         }
     });
-    receive
+    Ok((receive, signal))
 }
 
 #[derive(Clone, Copy, Debug)]

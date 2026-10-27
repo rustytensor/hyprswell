@@ -1,4 +1,5 @@
 mod ui;
+mod view;
 
 use gtk::prelude::*;
 use hyprswell::{ipc, rules};
@@ -22,6 +23,7 @@ pub fn log(message: &str) {
 
 fn main() {
     let mut output = None;
+    let mut swell = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -29,7 +31,7 @@ fn main() {
                 output = args.next();
                 if output.is_none() { eprintln!("--output needs a screen name"); std::process::exit(2); }
             }
-            "--no-swell" => {},
+            "--no-swell" => swell = false,
             "--help" | "-h" => { println!("hyprswell [--output NAME] [--no-swell]"); return; }
             _ => { eprintln!("unknown argument: {arg}"); std::process::exit(2); }
         }
@@ -53,6 +55,6 @@ fn main() {
     };
     let app = gtk::Application::builder().application_id("org.hyprswell.Dock")
         .flags(gio::ApplicationFlags::NON_UNIQUE).build();
-    app.connect_activate(move |app| ui::start(app, &selected));
+    app.connect_activate(move |app| ui::start(app, &selected, swell));
     app.run_with_args::<&str>(&[]);
 }
