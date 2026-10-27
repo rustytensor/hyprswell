@@ -36,19 +36,27 @@ fn main() {
             _ => { eprintln!("unknown argument: {arg}"); std::process::exit(2); }
         }
     }
+    let config = home_path("XDG_CONFIG_HOME", ".config").join("nwg-dock-hyprland/hyprswell.conf");
+    let filters = rules::screen_filters(&std::fs::read_to_string(config).unwrap_or_default());
     let deadline = Instant::now() + Duration::from_secs(10);
     let selected = loop {
         match ipc::monitors() {
             Ok(monitors) => {
-                let selected = rules::select_monitors(&monitors, output.as_deref());
-                if !selected.is_empty() { break selected; }
+                let selected = rules::select_monitors(&monitors, output.as_deref(), &filters);
+                if !selected.names.is_empty() {
+                    if selected.fallback {
+                        let reason = if filters.is_empty() { "SCREENS unset or empty" } else { "no SCREENS match" };
+                        log(&format!("{reason}; falling back to {}", selected.names[0]));
+                    }
+                    break selected.names;
+                }
             }
             Err(error) => {
                 if Instant::now() >= deadline { log(&format!("cannot list screens: {error}")); return; }
             }
         }
         if Instant::now() >= deadline {
-            log(if output.is_some() { "requested screen not found, no dock" } else { "no ultrawide found, no dock" });
+            log(if output.is_some() { "requested screen not found, no dock" } else { "no screens found, no dock" });
             return;
         }
         std::thread::sleep(Duration::from_millis(250));

@@ -137,21 +137,53 @@ fn icon_lookup_covers_swell() {
 }
 
 #[test]
-fn screens_match_model_not_port() {
+fn screens_config_and_fallback() {
     let monitors: Vec<Monitor> = serde_json::from_str(r#"[
-        {"name":"DP-2","description":"GWD ARZOPA 0x37330206"},
-        {"name":"HDMI-A-1","description":"Dell Inc. DELL U2515H YKFWP4CC09VL"},
-        {"name":"HDMI-A-2","description":"GWD ARZOPA 0000001504150"},
-        {"name":"DP-1","description":"Samsung Electric Company S34C65xU HCNYB00237"},
-        {"name":"DP-3","description":"Samsung Electric Company S34C65xU HCNYB00019"}
+        {"name":"DP-2","description":"GWD ARZOPA 0x37330206","x":1440,"y":1847},
+        {"name":"HDMI-A-1","description":"Dell Inc. DELL U2515H YKFWP4CC09VL","x":0,"y":0},
+        {"name":"HDMI-A-2","description":"GWD ARZOPA 0000001504150","x":4495,"y":1847},
+        {"name":"DP-1","description":"Samsung Electric Company S34C65xU HCNYB00237","x":1440,"y":407},
+        {"name":"DP-3","description":"Samsung Electric Company S34C65xU HCNYB00019","x":4880,"y":407}
     ]"#).unwrap();
-    // Only the two Samsung descriptions contain the model; explicit testing overrides that filter.
-    assert_eq!(rules::select_monitors(&monitors, None), ["DP-1", "DP-3"]);
-    assert_eq!(rules::select_monitors(&monitors, Some("DP-2")), ["DP-2"]);
-    assert!(rules::select_monitors(&monitors[..3], None).is_empty());
-    assert!(rules::select_monitors(&monitors, Some("unknown")).is_empty());
-    let moved = vec![Monitor { name: "DP-9".into(), description: monitors[3].description.clone() }];
-    assert_eq!(rules::select_monitors(&moved, None), ["DP-9"]);
+    // Captured layout: the two Samsungs match the selector; the Dell alone has y=0.
+    let filters = rules::screen_filters("SCREENS=S34C65xU\n");
+    assert_eq!(rules::select_monitors(&monitors, None, &filters), rules::ScreenSelection {
+        names: vec!["DP-1".into(), "DP-3".into()], fallback: false });
+    assert_eq!(rules::select_monitors(&monitors, None, &[]), rules::ScreenSelection {
+        names: vec!["HDMI-A-1".into()], fallback: true }, "unset falls back to top-left");
+    assert_eq!(rules::select_monitors(&monitors, None, &rules::screen_filters("SCREENS=, ,")),
+        rules::ScreenSelection { names: vec!["HDMI-A-1".into()], fallback: true });
+    let vm: Vec<Monitor> = serde_json::from_str(r#"[
+        {"name":"Virtual-1","description":"Virtual display","x":0,"y":0}
+    ]"#).unwrap();
+    // A copied machine-specific setting must not leave the VM without a dock.
+    assert_eq!(rules::select_monitors(&vm, None, &filters), rules::ScreenSelection {
+        names: vec!["Virtual-1".into()], fallback: true }, "no-match VM fallback");
+    assert_eq!(rules::select_monitors(&monitors, Some("DP-2"), &filters), rules::ScreenSelection {
+        names: vec!["DP-2".into()], fallback: false });
+    assert_eq!(rules::select_monitors(&monitors, Some("unknown"), &filters), rules::ScreenSelection {
+        names: vec![], fallback: false });
+    let moved = vec![Monitor { name: "DP-9".into(), description: monitors[3].description.clone(), x: 0, y: 0 }];
+    assert_eq!(rules::select_monitors(&moved, None, &filters).names, ["DP-9"]);
+    let ties: Vec<Monitor> = serde_json::from_str(r#"[
+        {"name":"Z","description":"Z","x":-1920,"y":-1080},
+        {"name":"B","description":"B","x":0,"y":-1080},
+        {"name":"A","description":"A","x":-1920,"y":-1080}
+    ]"#).unwrap();
+    // All y tie; -1920 wins x, then A wins the name tie with Z.
+    assert_eq!(rules::select_monitors(&ties, None, &[]).names, ["A"]);
+    assert_eq!(rules::select_monitors(&[], None, &filters), rules::ScreenSelection {
+        names: vec![], fallback: false });
+}
+
+#[test]
+fn screens_parsing() {
+    // Whitespace is decoration; empty and repeated items are not extra selectors.
+    assert_eq!(rules::screen_filters(" ICON_SIZE=48\n SCREENS = S34C65xU, , ARZOPA , S34C65xU \n"),
+        ["S34C65xU", "ARZOPA"]);
+    assert!(rules::screen_filters("ICON_SIZE=48\n# SCREENS=ignored\n").is_empty());
+    assert!(rules::screen_filters("SCREENS= , , \n").is_empty());
+    assert_eq!(rules::screen_filters("SCREENS=S34C65xU\nICON_SIZE=48\nSCREENS=Virtual\n"), ["Virtual"]);
 }
 
 #[test]

@@ -18,6 +18,8 @@ pub struct Client {
 pub struct Monitor {
     pub name: String,
     pub description: String,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,9 +115,36 @@ pub fn icon_lookup_size(drawn: u32) -> i32 {
     (u64::from(drawn) * 8).div_ceil(5).min(i32::MAX as u64) as i32
 }
 
-pub fn select_monitors(monitors: &[Monitor], output: Option<&str>) -> Vec<String> {
-    monitors.iter().filter(|m| match output {
-        Some(name) => m.name == name,
-        None => m.description.contains("S34C65xU"),
-    }).map(|m| m.name.clone()).collect()
+pub fn screen_filters(config: &str) -> Vec<String> {
+    let mut value = "";
+    for line in config.lines() {
+        if let Some((key, contents)) = line.split_once('=') {
+            if key.trim() == "SCREENS" { value = contents; }
+        }
+    }
+    let mut filters = Vec::new();
+    for item in value.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        if !filters.iter().any(|existing| existing == item) { filters.push(item.to_owned()); }
+    }
+    filters
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScreenSelection {
+    pub names: Vec<String>,
+    pub fallback: bool,
+}
+
+pub fn select_monitors(monitors: &[Monitor], output: Option<&str>, filters: &[String]) -> ScreenSelection {
+    if let Some(name) = output {
+        // Explicit test outputs must never silently put a dock on another screen.
+        return ScreenSelection { names: monitors.iter().filter(|m| m.name == name)
+            .map(|m| m.name.clone()).collect(), fallback: false };
+    }
+    let names: Vec<_> = monitors.iter().filter(|m| filters.iter().any(|part| m.description.contains(part)))
+        .map(|m| m.name.clone()).collect();
+    if !names.is_empty() { return ScreenSelection { names, fallback: false }; }
+    let names: Vec<_> = monitors.iter().min_by(|a, b| a.y.cmp(&b.y).then(a.x.cmp(&b.x)).then(a.name.cmp(&b.name)))
+        .map(|m| m.name.clone()).into_iter().collect();
+    ScreenSelection { fallback: !names.is_empty(), names }
 }
