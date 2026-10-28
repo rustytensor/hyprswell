@@ -45,6 +45,27 @@ def capture(pid, path):
     return row
 
 
+def wait_settled(child):
+    deadline = time.monotonic() + 10
+    last = None
+    unchanged_since = time.monotonic()
+    while time.monotonic() < deadline:
+        assert child.poll() is None, 'test dock exited while settling'
+        row = owned(child.pid)
+        reserved = monitor()['reserved']
+        signature = (row['x'], row['y'], row['w'], row['h'], tuple(reserved))
+        # ICON_SIZE=44 gives at most height161 with the approved 45% lane.
+        # Exclude GTK's initial 200x200 configure, then require one quiet second.
+        ready = row['w'] > 0 and 0 < row['h'] <= 161
+        if not ready or signature != last:
+            last = signature
+            unchanged_since = time.monotonic()
+        elif time.monotonic() - unchanged_since >= 1.0:
+            return row, reserved
+        time.sleep(.1)
+    raise AssertionError(f'no settled non-placeholder layer: {last}')
+
+
 def main():
     baseline = {(screen, row['pid'], row['address']) for screen, row in layers()}
     assert not any(screen == 'DP-2' for screen, _, _ in baseline), 'DP-2 already has a dock; do not stop it'
@@ -73,15 +94,18 @@ def main():
             with (home / 'stderr').open('w+') as errors:
                 child = subprocess.Popen([str(TARGET / 'debug/hyprswell'), '--output', 'DP-2'],
                                          env=env, stdout=errors, stderr=errors)
+                print(f'Test PID: {child.pid}', flush=True)
                 try:
                     deadline = time.monotonic() + 3
                     while not any(row.get('pid') == child.pid for _, row in layers()):
                         assert child.poll() is None, 'test dock exited before mapping'
                         assert time.monotonic() < deadline, 'no test layer within three seconds'
                         time.sleep(.05)
-                    time.sleep(.6)
+                    settled, reserved = wait_settled(child)
                     row = capture(child.pid, images / 'rest.png')
-                    reserved = monitor()['reserved']
+                    print('Rest:', images / 'rest.png', flush=True)
+                    print('Reservation before hover:', reserved, flush=True)
+                    assert all(row[k] == settled[k] for k in ('x', 'y', 'w', 'h')), 'layout changed before rest capture'
                     # One entry from outside, into the visible bar (not its transparent tail).
                     # Its centre is inside the input region even when crowded icons shrink.
                     move(row['x'] + row['w'] / 2,
@@ -89,15 +113,18 @@ def main():
                     time.sleep(.65)
                     assert child.poll() is None, 'test dock exited during hover'
                     grown = capture(child.pid, images / 'swollen.png')
-                    assert monitor()['reserved'] == reserved, 'reservation changed during swell'
+                    after = monitor()['reserved']
+                    print('Swollen:', images / 'swollen.png', flush=True)
+                    print('Reservation after hover:', after, flush=True)
+                    print('Surface before/after:', (row['w'], row['h']), (grown['w'], grown['h']), flush=True)
+                    assert after == reserved, 'reservation changed during swell'
                     assert (grown['w'], grown['h']) == (row['w'], row['h']), 'surface resized during swell'
                     errors.flush()
                     errors.seek(0)
                     diagnostics = errors.read()
                     assert not any(word in diagnostics for word in ('CRITICAL', 'WARNING', 'panicked', 'Theme parser error')), diagnostics[:2500]
                     print(f'DP-2 surface {row["w"]}x{row["h"]}; reservation {reserved[3]} px stayed fixed')
-                    print('Rest:', images / 'rest.png')
-                    print('Swollen:', images / 'swollen.png')
+
                 except Exception:
                     errors.flush()
                     errors.seek(0)
