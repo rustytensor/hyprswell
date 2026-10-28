@@ -44,17 +44,21 @@ struct State {
     config_path: PathBuf,
     size: u32,
     swell: bool,
+    reflections: bool,
+    reflections_allowed: bool,
     refresh_icons: bool,
 }
 
-pub fn start(app: &gtk::Application, outputs: &[String], swell: bool) {
+pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflections_allowed: bool) {
     if !app.windows().is_empty() { return; }
     let Some(display) = gtk::gdk::Display::default() else { log("no GTK display"); return; };
     if !gtk4_layer_shell::is_supported() { log("Wayland layer shell is unavailable"); app.quit(); return; }
     let config = home_path("XDG_CONFIG_HOME", ".config");
     let pins_path = home_path("XDG_CACHE_HOME", ".cache").join("nwg-dock-pinned");
     let config_path = config.join("nwg-dock-hyprland/hyprswell.conf");
-    let size = rules::icon_size(&std::fs::read_to_string(&config_path).unwrap_or_default());
+    let preferences = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let size = rules::icon_size(&preferences);
+    let reflections = rules::reflections_enabled(&preferences, reflections_allowed);
     let css = gtk::CssProvider::new();
     let style_path = config.join("hyprswell/style.css");
     load_css(&css, &style_path);
@@ -73,7 +77,8 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool) {
         window.set_layer(Layer::Top);
         window.set_monitor(Some(&monitor));
         window.set_anchor(Edge::Bottom, true);
-        window.set_margin(Edge::Bottom, 8);
+        // The canvas includes the existing 8px bottom gap, with no input in that tail.
+        window.set_margin(Edge::Bottom, 0);
         let view = DockView::new();
         window.set_child(Some(&view));
         let name_window = gtk::ApplicationWindow::builder().application(app)
@@ -99,7 +104,7 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool) {
     if docks.is_empty() { log("no matching GTK screens, no dock"); app.quit(); return; }
     let state = Rc::new(RefCell::new(State { docks, snapshot: ipc::Snapshot::default(), pending: None,
         menu_count: 0, items: vec![], signature: vec![], pinned: pins::load(&pins_path).unwrap_or_default(),
-        pins_path, config_path, size, swell, refresh_icons: true }));
+        pins_path, config_path, size, swell, reflections, reflections_allowed, refresh_icons: true }));
     for index in 0..state.borrow().docks.len() { connect_input(&state, index); }
     refresh(&state);
     let windows: Vec<_> = state.borrow().docks.iter().map(|dock| dock.window.clone()).collect();
@@ -183,19 +188,21 @@ fn load_css(css: &gtk::CssProvider, path: &std::path::Path) {
 fn refresh(state: &Shared) {
     let mut s = state.borrow_mut();
     if s.menu_count > 0 { return; }
-    let (pinned, size) = if s.refresh_icons {
+    let (pinned, size, reflections) = if s.refresh_icons {
+        let preferences = std::fs::read_to_string(&s.config_path).unwrap_or_default();
         (pins::load(&s.pins_path).unwrap_or_else(|_| s.pinned.clone()),
-         rules::icon_size(&std::fs::read_to_string(&s.config_path).unwrap_or_default()))
-    } else { (s.pinned.clone(), s.size) };
+         rules::icon_size(&preferences), rules::reflections_enabled(&preferences, s.reflections_allowed))
+    } else { (s.pinned.clone(), s.size, s.reflections) };
     let items = rules::items(&pinned, &s.snapshot.clients);
     let signature: Signature = items.iter().map(|item| (item.id.clone(), rules::indicator(&item.windows),
         item.windows.iter().any(|c| c.address == s.snapshot.active))).collect();
-    let rebuild = signature != s.signature || size != s.size || s.refresh_icons;
+    let rebuild = signature != s.signature || size != s.size || reflections != s.reflections || s.refresh_icons;
     let old_ids: Vec<_> = s.items.iter().map(|i| i.id.clone()).collect();
     s.items = items;
     s.signature = signature;
     s.pinned = pinned;
     s.size = size;
+    s.reflections = reflections;
     if rebuild {
         s.refresh_icons = false;
         let drawn = rules::drawn_size(size, s.items.len().saturating_sub(1)).max(1);
@@ -238,14 +245,17 @@ fn refresh(state: &Shared) {
     }
 }
 
-fn layout_config(size: u32, count: usize) -> (motion::LayoutConfig, i32) {
+fn layout_config(size: u32, count: usize, reflections: bool) -> (motion::LayoutConfig, i32) {
     let rest = rules::drawn_size(size, count.saturating_sub(1)).max(1) as f64 * 0.8;
     let bar_height = rest + 23.0;
-    let height = (rest * 2.2 + 36.0).ceil() as i32;
+    let base_height = (rest * 2.2 + 36.0).ceil() as i32;
     // Keep a fixed transparent surface; only the painted bar changes width.
     let width = (count as f64 * rest * 1.8 + count.saturating_sub(1) as f64 * 8.0 + 20.0).ceil();
-    (motion::LayoutConfig { surface_width: width, rest_width: rest, gap: 8.0, side_padding: 10.0,
-        bar_y: height as f64 - bar_height, bar_height, rest_bottom: height as f64 - 17.0 }, height)
+    let config = motion::reflection_layout(motion::LayoutConfig {
+        surface_width: width, rest_width: rest, gap: 8.0, side_padding: 10.0,
+        bar_y: base_height as f64 - bar_height, bar_height, rest_bottom: base_height as f64 - 17.0,
+    }, reflections);
+    (config, base_height + motion::reflection_padding(rest, reflections) as i32 + 8)
 }
 
 fn begin_leave(dock: &mut Dock) {
@@ -273,7 +283,8 @@ fn wake(state: &Shared, index: usize) {
 fn frame(state: &Shared, index: usize) -> bool {
     let now = Instant::now();
     let mut s = state.borrow_mut();
-    let (config, height) = layout_config(s.size, s.items.len());
+    let reflections = s.reflections;
+    let (config, height) = layout_config(s.size, s.items.len(), reflections);
     let ids: Vec<_> = s.items.iter().map(|item| item.id.clone()).collect();
     let swell = s.swell;
     let dock = &mut s.docks[index];
@@ -330,9 +341,10 @@ fn frame(state: &Shared, index: usize) -> bool {
         if let Some(i) = ids.iter().position(|id| dock.hovered.as_ref() == Some(id)) { layout.icons[i].y -= 6.0; }
     }
     dock.rectangles = layout.icons.clone();
-    dock.window.set_exclusive_zone(config.bar_height.ceil() as i32);
-    dock.view.update(Scene { width: config.surface_width as i32, height, layout,
-        icons: dock.icons.clone(), indicator_y: config.rest_bottom + 6.0 });
+    let shelf = reflections.then(|| motion::shelf(&layout, config.rest_bottom, config.side_padding));
+    dock.window.set_exclusive_zone(config.bar_height.ceil() as i32 + 8);
+    dock.view.update(Scene { width: config.surface_width as i32, height, layout, shelf,
+        icons: dock.icons.clone(), indicator_y: config.rest_bottom + motion::reflection_padding(config.rest_width, reflections) + 6.0 });
     update_name(&s, index);
     active
 }
@@ -436,7 +448,7 @@ fn update_name(s: &State, index: usize) {
         let x = (monitor.geometry().width() - dock.view.width()) / 2
             + (rect.x + rect.width / 2.0) as i32 - natural / 2;
         dock.name_window.set_margin(Edge::Left, x.max(0).min((monitor.geometry().width() - natural).max(0)));
-        dock.name_window.set_margin(Edge::Bottom, 8 + dock.view.height() - rect.y.floor() as i32 + 6);
+        dock.name_window.set_margin(Edge::Bottom, dock.view.height() - rect.y.floor() as i32 + 6);
         if !dock.name_window.is_visible() { dock.name_window.present(); }
     }
 }

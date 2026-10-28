@@ -24,6 +24,7 @@ pub fn log(message: &str) {
 fn main() {
     let mut output = None;
     let mut swell = true;
+    let mut reflections_allowed = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -32,40 +33,39 @@ fn main() {
                 if output.is_none() { eprintln!("--output needs a screen name"); std::process::exit(2); }
             }
             "--no-swell" => swell = false,
-            "--help" | "-h" => { println!("hyprswell [--output NAME] [--no-swell]"); return; }
+            "--no-reflections" => reflections_allowed = false,
+            "--help" | "-h" => { println!("hyprswell [--output NAME] [--no-swell] [--no-reflections]"); return; }
             _ => { eprintln!("unknown argument: {arg}"); std::process::exit(2); }
         }
     }
     let config = home_path("XDG_CONFIG_HOME", ".config").join("nwg-dock-hyprland/hyprswell.conf");
     let filters = rules::screen_filters(&std::fs::read_to_string(config).unwrap_or_default());
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pending = None;
     let selected = loop {
-        match ipc::monitors() {
-            Ok(monitors) => {
-                let selected = rules::select_monitors(&monitors, output.as_deref(), &filters);
-                // At login the chosen screens can come up after others: wait for them before falling back
-                // (10-20: two docks stacked on an ARZOPA when the ultrawides were late).
-                let early = selected.fallback && !filters.is_empty() && Instant::now() < deadline;
-                if !selected.names.is_empty() && !early {
-                    if selected.fallback {
-                        let reason = if filters.is_empty() { "SCREENS unset or empty" } else { "no SCREENS match" };
-                        log(&format!("{reason}; falling back to {}", selected.names[0]));
-                    }
-                    break selected.names;
-                }
+        let (current, error) = match ipc::monitors() {
+            Ok(monitors) => (Some(rules::select_monitors(&monitors, output.as_deref(), &filters)), None),
+            Err(error) => (None, Some(error)),
+        };
+        // One deadline decision per response: expiry must not discard a pending fallback.
+        let now = Instant::now();
+        let expired = now >= deadline;
+        if let Some(selected) = rules::startup_selection(current, &mut pending, !filters.is_empty(), expired) {
+            if selected.fallback {
+                let reason = if filters.is_empty() { "SCREENS unset or empty" } else { "no SCREENS match" };
+                log(&format!("{reason}; falling back to {}", selected.names[0]));
             }
-            Err(error) => {
-                if Instant::now() >= deadline { log(&format!("cannot list screens: {error}")); return; }
-            }
+            break selected.names;
         }
-        if Instant::now() >= deadline {
-            log(if output.is_some() { "requested screen not found, no dock" } else { "no screens found, no dock" });
+        if expired {
+            if let Some(error) = error { log(&format!("cannot list screens: {error}")); }
+            else { log(if output.is_some() { "requested screen not found, no dock" } else { "no screens found, no dock" }); }
             return;
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(250).min(deadline.saturating_duration_since(now)));
     };
     let app = gtk::Application::builder().application_id("org.hyprswell.Dock")
         .flags(gio::ApplicationFlags::NON_UNIQUE).build();
-    app.connect_activate(move |app| ui::start(app, &selected, swell));
+    app.connect_activate(move |app| ui::start(app, &selected, swell, reflections_allowed));
     app.run_with_args::<&str>(&[]);
 }

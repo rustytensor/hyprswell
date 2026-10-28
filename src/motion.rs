@@ -136,6 +136,36 @@ impl Layout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reflection {
+    pub image: Rect,
+    pub visible: Rect,
+    pub flip_y: f64,
+    pub stops: [(f64, f64); 2],
+}
+
+pub fn reflection(icon: Rect, baseline: f64) -> Reflection {
+    let rise = baseline - (icon.y + icon.height);
+    let top = baseline + rise;
+    let image = Rect { x: icon.x, y: top, width: icon.width, height: icon.height };
+    Reflection { image, visible: Rect { height: icon.height * 0.30, ..image },
+        flip_y: top + icon.height, stops: [(0.0, 0.35), (1.0, 0.0)] }
+}
+
+pub fn reflection_padding(rest_width: f64, enabled: bool) -> f64 {
+    if enabled { (rest_width * 0.30).ceil() } else { 0.0 }
+}
+
+pub fn reflection_layout(mut config: LayoutConfig, enabled: bool) -> LayoutConfig {
+    config.bar_height += reflection_padding(config.rest_width, enabled);
+    config
+}
+
+pub fn shelf(layout: &Layout, baseline: f64, side_padding: f64) -> Rect {
+    Rect { x: layout.bar.x + side_padding, y: baseline,
+        width: (layout.bar.width - 2.0 * side_padding).max(0.0), height: 1.0 }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sample {
     pub value: f64,
     /// Units per second, suitable for continuous retargeting.

@@ -19,6 +19,7 @@ pub struct Scene {
     pub layout: motion::Layout,
     pub icons: Vec<Icon>,
     pub indicator_y: f64,
+    pub shelf: Option<motion::Rect>,
 }
 
 mod imp {
@@ -29,6 +30,7 @@ mod imp {
         pub bar_style: RefCell<Option<gtk::Box>>,
         pub indicator_style: RefCell<Option<gtk::Label>>,
         pub active_style: RefCell<Option<gtk::Box>>,
+        pub shelf_style: RefCell<Option<gtk::Box>>,
     }
     #[glib::object_subclass]
     impl ObjectSubclass for DockView {
@@ -53,6 +55,10 @@ mod imp {
             let scene = self.scene.borrow();
             let Some(scene) = scene.as_ref() else { return; };
             allocate_style(self.bar_style.borrow().as_ref().unwrap(), scene.layout.bar);
+            let shelf = self.shelf_style.borrow();
+            let shelf = shelf.as_ref().unwrap();
+            shelf.set_child_visible(scene.shelf.is_some());
+            if let Some(rect) = scene.shelf { allocate_style(shelf, rect); }
             let active = self.active_style.borrow();
             let active = active.as_ref().unwrap();
             let icon = scene.icons.iter().zip(&scene.layout.icons).find(|(icon, _)| icon.active);
@@ -75,6 +81,31 @@ mod imp {
             let styles = self.bar_style.borrow();
             let bar = styles.as_ref().unwrap();
             self.obj().snapshot_child(bar, snapshot);
+            if let Some(shelf) = scene.shelf {
+                for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
+                    let reflected = motion::reflection(motion::Rect { y: rect.y - icon.bounce, ..*rect }, shelf.y);
+                    let clip = gtk::graphene::Rect::new(reflected.visible.x as f32, reflected.visible.y as f32,
+                        reflected.visible.width as f32, reflected.visible.height as f32);
+                    let stops = reflected.stops.map(|(offset, alpha)| gtk::gsk::ColorStop::new(
+                        offset as f32, gtk::gdk::RGBA::new(1.0, 1.0, 1.0, alpha as f32)));
+                    snapshot.push_clip(&clip);
+                    // GTK records the mask before the first pop, then its source before the second.
+                    snapshot.push_mask(gtk::gsk::MaskMode::Alpha);
+                    snapshot.append_linear_gradient(&clip,
+                        &gtk::graphene::Point::new(reflected.visible.x as f32, reflected.visible.y as f32),
+                        &gtk::graphene::Point::new(reflected.visible.x as f32,
+                            (reflected.visible.y + reflected.visible.height) as f32), &stops);
+                    snapshot.pop();
+                    snapshot.save();
+                    snapshot.translate(&gtk::graphene::Point::new(reflected.image.x as f32, reflected.flip_y as f32));
+                    snapshot.scale(1.0, -1.0);
+                    paint_icon(icon, snapshot, reflected.image.width, reflected.image.height, bar.color());
+                    snapshot.restore();
+                    snapshot.pop();
+                    snapshot.pop();
+                }
+                self.obj().snapshot_child(self.shelf_style.borrow().as_ref().unwrap(), snapshot);
+            }
             for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
                 snapshot.save();
                 if icon.shadow {
@@ -82,9 +113,7 @@ mod imp {
                         gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.35), 0.0, 6.0, 10.0)]);
                 }
                 snapshot.translate(&gtk::graphene::Point::new(rect.x as f32, (rect.y - icon.bounce) as f32));
-                if let Some(symbolic) = icon.paintable.dynamic_cast_ref::<gtk::SymbolicPaintable>() {
-                    symbolic.snapshot_symbolic(snapshot, rect.width, rect.height, &[bar.color(); 4]);
-                } else { icon.paintable.snapshot(snapshot, rect.width, rect.height); }
+                paint_icon(icon, snapshot, rect.width, rect.height, bar.color());
                 if icon.shadow { snapshot.pop(); }
                 snapshot.restore();
             }
@@ -107,6 +136,12 @@ mod imp {
             self.obj().snapshot_child(self.active_style.borrow().as_ref().unwrap(), snapshot);
         }
     }
+}
+
+fn paint_icon(icon: &Icon, snapshot: &gtk::Snapshot, width: f64, height: f64, color: gtk::gdk::RGBA) {
+    if let Some(symbolic) = icon.paintable.dynamic_cast_ref::<gtk::SymbolicPaintable>() {
+        symbolic.snapshot_symbolic(snapshot, width, height, &[color; 4]);
+    } else { icon.paintable.snapshot(snapshot, width, height); }
 }
 
 // GTK 4's widget snapshot paints CSS backgrounds and borders without style contexts.
@@ -136,6 +171,12 @@ impl DockView {
         let indicator = gtk::Label::new(None);
         indicator.add_css_class("dock-indicator");
         *view.imp().bar_style.borrow_mut() = Some(bar);
+        let shelf = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        shelf.add_css_class("dock-shelf");
+        shelf.set_can_target(false);
+        shelf.set_child_visible(false);
+        shelf.set_parent(&view);
+        *view.imp().shelf_style.borrow_mut() = Some(shelf);
         *view.imp().indicator_style.borrow_mut() = Some(indicator);
         let active = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         active.add_css_class("dock-item");

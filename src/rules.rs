@@ -129,10 +129,31 @@ pub fn screen_filters(config: &str) -> Vec<String> {
     filters
 }
 
+pub fn reflections_enabled(config: &str, allowed: bool) -> bool {
+    let mut enabled = true;
+    for line in config.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "REFLECTIONS" { enabled = value.trim() != "0"; }
+        }
+    }
+    allowed && enabled
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenSelection {
     pub names: Vec<String>,
     pub fallback: bool,
+}
+
+// Retain a usable fallback across IPC errors, but not a fresh empty monitor list.
+pub fn startup_selection(current: Option<ScreenSelection>, pending: &mut Option<ScreenSelection>,
+                         configured: bool, expired: bool) -> Option<ScreenSelection> {
+    if let Some(selection) = current {
+        if selection.names.is_empty() { *pending = None; }
+        else if !selection.fallback || !configured { return Some(selection); }
+        else { *pending = Some(selection); }
+    }
+    if expired { pending.take() } else { None }
 }
 
 pub fn select_monitors(monitors: &[Monitor], output: Option<&str>, filters: &[String]) -> ScreenSelection {

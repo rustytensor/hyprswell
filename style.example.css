@@ -12,6 +12,7 @@ window.dock-window, window.dock-name-window { background: transparent; }
 .dock-icon { transform: scale(0.8); transition: transform 220ms ease-out; }
 .dock-item:hover .dock-icon { transform: translateY(-6px) scale(0.8); }
 .dock-item:active .dock-icon { transform: translateY(-3px) scale(0.72); transition-duration: 90ms; }
+.dock-shelf { background: alpha(#7aa2f7, 0.18); min-height: 1px; }
 .dock-indicator { color: #7aa2f7; font-size: 10px; min-height: 8px; }
 .dock-item.active { border-bottom: 3px solid #7aa2f7; }
 @keyframes dock-bounce {
