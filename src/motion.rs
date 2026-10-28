@@ -147,12 +147,12 @@ pub fn reflection(icon: Rect, baseline: f64) -> Reflection {
     let rise = baseline - (icon.y + icon.height);
     let top = baseline + rise;
     let image = Rect { x: icon.x, y: top, width: icon.width, height: icon.height };
-    Reflection { image, visible: Rect { height: icon.height * 0.30, ..image },
-        flip_y: top + icon.height, stops: [(0.0, 0.35), (1.0, 0.0)] }
+    Reflection { image, visible: Rect { height: icon.height * 0.45, ..image },
+        flip_y: top + icon.height, stops: [(0.0, 0.55), (1.0, 0.0)] }
 }
 
 pub fn reflection_padding(rest_width: f64, enabled: bool) -> f64 {
-    if enabled { (rest_width * 0.30).ceil() } else { 0.0 }
+    if enabled { (rest_width * 0.45).ceil() } else { 0.0 }
 }
 
 pub fn reflection_layout(mut config: LayoutConfig, enabled: bool) -> LayoutConfig {
