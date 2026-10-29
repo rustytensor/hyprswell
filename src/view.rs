@@ -1,11 +1,12 @@
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use hyprswell::{motion, rules};
+use hyprswell::{grid, motion, rules};
 use std::cell::RefCell;
 
 #[derive(Clone)]
 pub struct Icon {
-    pub paintable: gtk::gdk::Paintable,
+    pub paintable: Option<gtk::gdk::Paintable>,
+    pub grid: Option<grid::Look>,
     pub indicator: rules::Indicator,
     pub active: bool,
     pub shadow: bool,
@@ -80,10 +81,13 @@ mod imp {
             let Some(scene) = scene.as_ref() else { return; };
             let styles = self.bar_style.borrow();
             let bar = styles.as_ref().unwrap();
+            let accent = self.indicator_style.borrow().as_ref().unwrap().color();
             self.obj().snapshot_child(bar, snapshot);
             if let Some(shelf) = scene.shelf {
                 for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
-                    let reflected = motion::reflection(motion::Rect { y: rect.y - icon.bounce, ..*rect }, shelf.y);
+                    let actual = motion::Rect { y: rect.y - icon.bounce, ..*rect };
+                    let reflected = if icon.grid.is_some() { grid::reflection(actual) }
+                        else { motion::reflection(actual, shelf.y) };
                     let clip = gtk::graphene::Rect::new(reflected.visible.x as f32, reflected.visible.y as f32,
                         reflected.visible.width as f32, reflected.visible.height as f32);
                     let stops = reflected.stops.map(|(offset, alpha)| gtk::gsk::ColorStop::new(
@@ -99,7 +103,7 @@ mod imp {
                     snapshot.save();
                     snapshot.translate(&gtk::graphene::Point::new(reflected.image.x as f32, reflected.flip_y as f32));
                     snapshot.scale(1.0, -1.0);
-                    paint_icon(icon, snapshot, reflected.image.width, reflected.image.height, bar.color());
+                    paint_icon(icon, snapshot, reflected.image.width, reflected.image.height, bar.color(), accent);
                     snapshot.restore();
                     snapshot.pop();
                     snapshot.pop();
@@ -113,12 +117,11 @@ mod imp {
                         gtk::gdk::RGBA::new(0.0, 0.0, 0.0, 0.35), 0.0, 6.0, 10.0)]);
                 }
                 snapshot.translate(&gtk::graphene::Point::new(rect.x as f32, (rect.y - icon.bounce) as f32));
-                paint_icon(icon, snapshot, rect.width, rect.height, bar.color());
+                paint_icon(icon, snapshot, rect.width, rect.height, bar.color(), accent);
                 if icon.shadow { snapshot.pop(); }
                 snapshot.restore();
             }
-            let style = self.indicator_style.borrow();
-            let color = style.as_ref().unwrap().color();
+            let color = accent;
             let cr = snapshot.append_cairo(&gtk::graphene::Rect::new(0.0, 0.0, scene.width as f32, scene.height as f32));
             cr.set_source_rgba(color.red() as f64, color.green() as f64, color.blue() as f64, color.alpha() as f64);
             for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
@@ -138,10 +141,24 @@ mod imp {
     }
 }
 
-fn paint_icon(icon: &Icon, snapshot: &gtk::Snapshot, width: f64, height: f64, color: gtk::gdk::RGBA) {
-    if let Some(symbolic) = icon.paintable.dynamic_cast_ref::<gtk::SymbolicPaintable>() {
-        symbolic.snapshot_symbolic(snapshot, width, height, &[color; 4]);
-    } else { icon.paintable.snapshot(snapshot, width, height); }
+fn paint_icon(icon: &Icon, snapshot: &gtk::Snapshot, width: f64, height: f64,
+              color: gtk::gdk::RGBA, accent: gtk::gdk::RGBA) {
+    if let Some(look) = icon.grid {
+        let (dots, radius) = grid::dots(motion::Rect { x: 0.0, y: 0.0, width, height }, look);
+        let cr = snapshot.append_cairo(&gtk::graphene::Rect::new(0.0, 0.0, width as f32, height as f32));
+        let mix = |a: f32, b: f32| a as f64 + (b - a) as f64 * look.accent;
+        cr.set_source_rgba(mix(color.red(), accent.red()), mix(color.green(), accent.green()),
+                           mix(color.blue(), accent.blue()), mix(color.alpha(), accent.alpha()));
+        for (x, y) in dots {
+            cr.new_sub_path();
+            cr.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+            let _ = cr.fill();
+        }
+    } else if let Some(paintable) = &icon.paintable {
+        if let Some(symbolic) = paintable.dynamic_cast_ref::<gtk::SymbolicPaintable>() {
+            symbolic.snapshot_symbolic(snapshot, width, height, &[color; 4]);
+        } else { paintable.snapshot(snapshot, width, height); }
+    }
 }
 
 // GTK 4's widget snapshot paints CSS backgrounds and borders without style contexts.

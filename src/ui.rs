@@ -2,7 +2,7 @@ use crate::{home_path, log, view::{DockView, Icon, Scene}};
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
-use hyprswell::{desktop, ipc, motion, pins, rules};
+use hyprswell::{desktop, grid, ipc, motion, pins, rules};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
@@ -31,6 +31,8 @@ struct Dock {
     rectangles: Vec<motion::Rect>,
     ticking: bool,
     last_tick: Instant,
+    grid_animation: grid::Animation,
+    grid_epoch: Instant,
 }
 
 struct State {
@@ -47,6 +49,7 @@ struct State {
     swell: bool,
     reflections: bool,
     reflections_allowed: bool,
+    launcher: grid::Position,
     refresh_icons: bool,
 }
 
@@ -60,6 +63,7 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
     let preferences = std::fs::read_to_string(&config_path).unwrap_or_default();
     let size = rules::icon_size(&preferences);
     let reflections = rules::reflections_enabled(&preferences, reflections_allowed);
+    let launcher = grid::position(&preferences);
     let css = gtk::CssProvider::new();
     let style_path = config.join("hyprswell/style.css");
     load_css(&css, &style_path);
@@ -100,12 +104,13 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
         });
         docks.push(Dock { output: output.clone(), window, view, name_window, name_label, icons: vec![], hovered: None,
             pointer: None, scales: vec![], velocities: vec![], leaving: None, clicks: HashMap::new(),
-            launches: HashMap::new(), rectangles: vec![], ticking: false, last_tick: Instant::now() });
+            launches: HashMap::new(), rectangles: vec![], ticking: false, last_tick: Instant::now(),
+            grid_animation: grid::Animation::default(), grid_epoch: Instant::now() });
     }
     if docks.is_empty() { log("no matching GTK screens, no dock"); app.quit(); return; }
     let state = Rc::new(RefCell::new(State { docks, snapshot: ipc::Snapshot::default(), pending: None,
         menu_count: 0, items: vec![], signature: vec![], pinned: pins::load(&pins_path).unwrap_or_default(),
-        pins_path, config_path, size, swell, reflections, reflections_allowed, refresh_icons: true }));
+        pins_path, config_path, size, swell, reflections, reflections_allowed, launcher, refresh_icons: true }));
     for index in 0..state.borrow().docks.len() { connect_input(&state, index); }
     refresh(&state);
     let windows: Vec<_> = state.borrow().docks.iter().map(|dock| dock.window.clone()).collect();
@@ -229,38 +234,42 @@ fn load_css(css: &gtk::CssProvider, path: &std::path::Path) {
 fn refresh(state: &Shared) {
     let mut s = state.borrow_mut();
     if s.menu_count > 0 { return; }
-    let (pinned, size, reflections) = if s.refresh_icons {
+    let (pinned, size, reflections, launcher) = if s.refresh_icons {
         let preferences = std::fs::read_to_string(&s.config_path).unwrap_or_default();
         (pins::load(&s.pins_path).unwrap_or_else(|_| s.pinned.clone()),
-         rules::icon_size(&preferences), rules::reflections_enabled(&preferences, s.reflections_allowed))
-    } else { (s.pinned.clone(), s.size, s.reflections) };
-    let items = rules::items(&pinned, &s.snapshot.clients);
+         rules::icon_size(&preferences), rules::reflections_enabled(&preferences, s.reflections_allowed),
+         grid::position(&preferences))
+    } else { (s.pinned.clone(), s.size, s.reflections, s.launcher) };
+    let items = grid::place_items(rules::items(&pinned, &s.snapshot.clients), launcher);
     let signature: Signature = items.iter().map(|item| (item.id.clone(), rules::indicator(&item.windows),
         item.windows.iter().any(|c| c.address == s.snapshot.active))).collect();
-    let rebuild = signature != s.signature || size != s.size || reflections != s.reflections || s.refresh_icons;
+    let rebuild = signature != s.signature || size != s.size || reflections != s.reflections || launcher != s.launcher || s.refresh_icons;
+    let old_launcher = s.launcher;
     let old_ids: Vec<_> = s.items.iter().map(|i| i.id.clone()).collect();
     s.items = items;
     s.signature = signature;
     s.pinned = pinned;
     s.size = size;
     s.reflections = reflections;
+    s.launcher = launcher;
     if rebuild {
         s.refresh_icons = false;
-        let drawn = rules::drawn_size(size, s.items.len().saturating_sub(1)).max(1);
+        let drawn = rules::drawn_size(size, grid::app_count(&s.items)).max(1);
         let lookup = rules::icon_lookup_size(drawn);
         let icons: Vec<_> = s.items.iter().map(|item| {
             let display = s.docks[0].view.display();
             let theme = gtk::IconTheme::for_display(&display);
             let scale = s.docks[0].view.scale_factor();
-            let info = if item.id == "launcher" { None } else { desktop::app_info(&item.id) };
-            let paintable = if let Some(icon) = info.and_then(|a| a.icon()) {
-                theme.lookup_by_gicon(&icon, lookup, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
-            } else {
-                let name = if item.id == "launcher" { "view-app-grid-symbolic" }
-                    else if theme.has_icon(&item.id) { &item.id } else { "image-missing" };
-                theme.lookup_icon(name, &[], lookup, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
+            let paintable = if item.id == "launcher" { None } else {
+                let image = if let Some(icon) = desktop::app_info(&item.id).and_then(|a| a.icon()) {
+                    theme.lookup_by_gicon(&icon, lookup, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
+                } else {
+                    let name = if theme.has_icon(&item.id) { &item.id } else { "image-missing" };
+                    theme.lookup_icon(name, &[], lookup, scale, gtk::TextDirection::None, gtk::IconLookupFlags::empty())
+                };
+                Some(image.upcast())
             };
-            Icon { paintable: paintable.upcast(), indicator: rules::indicator(&item.windows),
+            Icon { paintable, grid: (item.id == "launcher").then_some(grid::Look::default()), indicator: rules::indicator(&item.windows),
                 active: item.windows.iter().any(|c| c.address == s.snapshot.active), shadow: false, bounce: 0.0 }
         }).collect();
         let ids: Vec<_> = s.items.iter().map(|i| i.id.clone()).collect();
@@ -270,6 +279,11 @@ fn refresh(state: &Shared) {
             dock.scales = ids.iter().map(|id| old.get(id).map_or(1.0, |s| s.0)).collect();
             dock.velocities = ids.iter().map(|id| old.get(id).map_or(0.0, |s| s.1)).collect();
             dock.icons = icons.clone();
+            if launcher != old_launcher || launcher == grid::Position::Off {
+                dock.grid_animation = grid::Animation::default();
+                dock.grid_epoch = Instant::now();
+                if dock.hovered.as_deref() == Some("launcher") { dock.hovered = None; }
+            }
             if dock.hovered.as_ref().is_some_and(|id| !ids.contains(id)) { dock.hovered = None; }
             if dock.pointer.is_none() { begin_leave(dock); }
         }
@@ -286,8 +300,8 @@ fn refresh(state: &Shared) {
     }
 }
 
-fn layout_config(size: u32, count: usize, reflections: bool) -> (motion::LayoutConfig, i32) {
-    let rest = rules::drawn_size(size, count.saturating_sub(1)).max(1) as f64 * 0.8;
+fn layout_config(size: u32, count: usize, apps: usize, reflections: bool) -> (motion::LayoutConfig, i32) {
+    let rest = rules::drawn_size(size, apps).max(1) as f64 * 0.8;
     let bar_height = rest + 23.0;
     let base_height = (rest * 2.2 + 36.0).ceil() as i32;
     // Keep a fixed transparent surface; only the painted bar changes width.
@@ -325,8 +339,9 @@ fn frame(state: &Shared, index: usize) -> bool {
     let now = Instant::now();
     let mut s = state.borrow_mut();
     let reflections = s.reflections;
-    let (config, height) = layout_config(s.size, s.items.len(), reflections);
+    let (config, height) = layout_config(s.size, s.items.len(), grid::app_count(&s.items), reflections);
     let ids: Vec<_> = s.items.iter().map(|item| item.id.clone()).collect();
+    let grid_index = ids.iter().position(|id| id == "launcher");
     let swell = s.swell;
     let dock = &mut s.docks[index];
     let dt = now.duration_since(dock.last_tick).as_secs_f64().min(0.1);
@@ -335,16 +350,18 @@ fn frame(state: &Shared, index: usize) -> bool {
     if swell {
         if let Some((x, _)) = dock.pointer {
             dock.leaving = None;
-            let rest = config.layout(&vec![1.0; ids.len()]);
+            let rest = grid::layout(config, &vec![1.0; ids.len()], grid_index);
             let centres: Vec<_> = rest.icons.iter().map(|r| r.x + r.width / 2.0).collect();
             let targets = motion::pointer_scales(&centres, Some(x), config.rest_width);
             for (i, target) in targets.into_iter().enumerate() {
+                if Some(i) == grid_index { dock.scales[i] = 1.0; dock.velocities[i] = 0.0; continue; }
                 let next = target + (dock.scales[i] - target) * (-dt / 0.045).exp();
                 if (next - target).abs() < 0.0001 { dock.scales[i] = target; dock.velocities[i] = 0.0; }
                 else { dock.velocities[i] = (target - next) / 0.045; dock.scales[i] = next; active = true; }
             }
         } else if let Some((start, springs)) = &dock.leaving {
             for (i, spring) in springs.iter().enumerate() {
+                if Some(i) == grid_index { dock.scales[i] = 1.0; dock.velocities[i] = 0.0; continue; }
                 let sample = spring.sample(now.duration_since(*start).as_secs_f64());
                 dock.scales[i] = sample.value;
                 dock.velocities[i] = sample.velocity;
@@ -359,13 +376,13 @@ fn frame(state: &Shared, index: usize) -> bool {
     }
     let mut scales = dock.scales.clone();
     for (i, id) in ids.iter().enumerate() {
+        dock.icons[i].bounce = 0.0;
+        if Some(i) == grid_index { continue; }
         if let Some(start) = dock.clicks.get(id) {
             let sample = motion::click_squash(now.duration_since(*start).as_secs_f64());
             scales[i] *= sample.value;
             active |= sample.active;
         }
-        dock.icons[i].shadow = swell && dock.hovered.as_ref() == Some(id);
-        dock.icons[i].bounce = 0.0;
         if let Some(start) = dock.launches.get(id) {
             let t = now.duration_since(*start).as_secs_f64();
             if t < 2.0 {
@@ -377,9 +394,25 @@ fn frame(state: &Shared, index: usize) -> bool {
     }
     dock.clicks.retain(|_, start| now.duration_since(*start).as_secs_f64() < 0.44);
     dock.launches.retain(|_, start| now.duration_since(*start).as_secs_f64() < 2.0);
-    let mut layout = config.layout(&scales);
+    let mut layout = grid::layout(config, &scales, grid_index);
     if !swell {
-        if let Some(i) = ids.iter().position(|id| dock.hovered.as_ref() == Some(id)) { layout.icons[i].y -= 6.0; }
+        if let Some(i) = ids.iter().position(|id| dock.hovered.as_ref() == Some(id)) {
+            if Some(i) != grid_index { layout.icons[i].y -= 6.0; }
+        }
+    }
+    let grid_hovered = grid_index.is_some_and(|i| dock.pointer.is_some_and(|(x, y)| {
+        let r = layout.icons[i];
+        x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+    }));
+    if grid_hovered && dock.hovered.as_deref() != Some("launcher") { dock.hovered = Some("launcher".into()); }
+    else if !grid_hovered && dock.hovered.as_deref() == Some("launcher") { dock.hovered = None; }
+    let time = now.duration_since(dock.grid_epoch).as_secs_f64();
+    dock.grid_animation.set_hover(grid_hovered, time);
+    let control = dock.grid_animation.sample(time);
+    active |= control.active;
+    for (i, icon) in dock.icons.iter_mut().enumerate() {
+        icon.grid = (Some(i) == grid_index).then_some(control.look);
+        icon.shadow = swell && Some(i) != grid_index && dock.hovered.as_ref() == Some(&ids[i]);
     }
     dock.rectangles = layout.icons.clone();
     let shelf = reflections.then(|| motion::shelf(&layout, config.rest_bottom, config.side_padding));
@@ -387,6 +420,8 @@ fn frame(state: &Shared, index: usize) -> bool {
     dock.view.update(Scene { width: config.surface_width as i32, height, layout, shelf,
         icons: dock.icons.clone(), indicator_y: config.rest_bottom + motion::reflection_padding(config.rest_width, reflections) + 6.0 });
     update_name(&s, index);
+    drop(s);
+    if control.launch { launch_launcher(); }
     active
 }
 
@@ -416,6 +451,7 @@ fn connect_input(state: &Shared, index: usize) {
                 let dock = &mut s.docks[index];
                 dock.pointer = None;
                 dock.hovered = None;
+                dock.grid_animation.set_hover(false, dock.grid_epoch.elapsed().as_secs_f64());
                 dock.name_window.set_visible(false);
                 begin_leave(dock);
             }
@@ -426,12 +462,17 @@ fn connect_input(state: &Shared, index: usize) {
     let click = gtk::GestureClick::new();
     click.set_button(0);
     let weak = Rc::downgrade(state);
-    click.connect_pressed(move |_, _, x, y| {
+    click.connect_pressed(move |gesture, _, x, y| {
         if let Some(state) = weak.upgrade() {
             let mut s = state.borrow_mut();
             if let Some(i) = hit(&s.docks[index], x, y) {
                 let id = s.items[i].id.clone();
-                s.docks[index].clicks.insert(id, Instant::now());
+                if id == "launcher" {
+                    if matches!(gesture.current_button(), 1 | 2) {
+                        let dock = &mut s.docks[index];
+                        dock.grid_animation.press(dock.grid_epoch.elapsed().as_secs_f64());
+                    }
+                } else { s.docks[index].clicks.insert(id, Instant::now()); }
                 drop(s);
                 wake(&state, index);
             }
@@ -440,13 +481,23 @@ fn connect_input(state: &Shared, index: usize) {
     let weak = Rc::downgrade(state);
     click.connect_released(move |click, _, x, y| {
         if let Some(state) = weak.upgrade() {
-            let s = state.borrow();
-            let Some(i) = hit(&s.docks[index], x, y) else { return; };
+            let mut s = state.borrow_mut();
+            let hit_index = hit(&s.docks[index], x, y);
+            if s.docks[index].grid_animation.is_pressed() {
+                let activate = hit_index.is_some_and(|i| s.items[i].id == "launcher")
+                    && matches!(click.current_button(), 1 | 2);
+                let dock = &mut s.docks[index];
+                dock.grid_animation.release(dock.grid_epoch.elapsed().as_secs_f64(), activate);
+                drop(s);
+                wake(&state, index);
+                return;
+            }
+            let Some(i) = hit_index else { return; };
             let item = s.items[i].clone();
             let active = s.snapshot.active.clone();
             drop(s);
             match click.current_button() {
-                1 | 2 if item.id == "launcher" => launch_launcher(),
+                1 | 2 if item.id == "launcher" => {},
                 1 => {
                     let action = rules::left_click(&item.id, &item.windows, &active);
                     if matches!(action, rules::Action::Menu(_)) { window_menu(&state, index, i, &item.windows); }
@@ -458,16 +509,29 @@ fn connect_input(state: &Shared, index: usize) {
             }
         }
     });
+    let weak = Rc::downgrade(state);
+    click.connect_cancel(move |_, _| { if let Some(state) = weak.upgrade() { cancel_grid(&state, index); } });
     view.add_controller(click);
     let weak = Rc::downgrade(state);
     view.connect_map(move |_| { if let Some(state) = weak.upgrade() { wake(&state, index); } });
 }
 
+fn cancel_grid(state: &Shared, index: usize) {
+    let mut s = state.borrow_mut();
+    let dock = &mut s.docks[index];
+    if !dock.grid_animation.is_pressed() { return; }
+    dock.grid_animation.release(dock.grid_epoch.elapsed().as_secs_f64(), false);
+    drop(s);
+    wake(state, index);
+}
+
 fn pointer(state: &Shared, index: usize, x: f64, y: f64) {
     let mut s = state.borrow_mut();
     let hovered = hit(&s.docks[index], x, y).map(|i| s.items[i].id.clone());
-    s.docks[index].pointer = Some((x, y));
-    s.docks[index].hovered = hovered;
+    let dock = &mut s.docks[index];
+    dock.grid_animation.set_hover(hovered.as_deref() == Some("launcher"), dock.grid_epoch.elapsed().as_secs_f64());
+    dock.pointer = Some((x, y));
+    dock.hovered = hovered;
     drop(s);
     wake(state, index);
 }
@@ -489,7 +553,9 @@ fn update_name(s: &State, index: usize) {
         let x = (monitor.geometry().width() - dock.view.width()) / 2
             + (rect.x + rect.width / 2.0) as i32 - natural / 2;
         dock.name_window.set_margin(Edge::Left, x.max(0).min((monitor.geometry().width() - natural).max(0)));
-        dock.name_window.set_margin(Edge::Bottom, dock.view.height() - rect.y.floor() as i32 + 6);
+        // The lower grid must not put its label over neighbouring application icons.
+        let top = if item.id == "launcher" { dock.rectangles.iter().fold(rect.y, |top, r| top.min(r.y)) } else { rect.y };
+        dock.name_window.set_margin(Edge::Bottom, dock.view.height() - top.floor() as i32 + 6);
         if !dock.name_window.is_visible() { dock.name_window.present(); }
     }
 }
