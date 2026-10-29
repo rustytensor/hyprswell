@@ -15,6 +15,7 @@ type Shared = Rc<RefCell<State>>;
 type Signature = Vec<(String, rules::Indicator, bool)>;
 
 struct Dock {
+    output: String,
     window: gtk::ApplicationWindow,
     view: DockView,
     name_window: gtk::ApplicationWindow,
@@ -97,7 +98,7 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
         name_window.connect_map(|window| {
             if let Some(surface) = window.surface() { surface.set_input_region(&gtk::cairo::Region::create()); }
         });
-        docks.push(Dock { window, view, name_window, name_label, icons: vec![], hovered: None,
+        docks.push(Dock { output: output.clone(), window, view, name_window, name_label, icons: vec![], hovered: None,
             pointer: None, scales: vec![], velocities: vec![], leaving: None, clicks: HashMap::new(),
             launches: HashMap::new(), rectangles: vec![], ticking: false, last_tick: Instant::now() });
     }
@@ -109,6 +110,17 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
     refresh(&state);
     let windows: Vec<_> = state.borrow().docks.iter().map(|dock| dock.window.clone()).collect();
     for window in windows { window.present(); }
+    // A sleeping screen is unplugged: its dock would move to whichever screen is left (10-28: both docks on the
+    // ARZOPA). Hide a dock while its screen is gone and put it back when the screen returns.
+    let weak = Rc::downgrade(&state);
+    display.monitors().connect_items_changed(move |_, _, _, _| {
+        for delay in [500, 2500] {   // a returning screen can get its connector name a moment later
+            let weak = weak.clone();
+            glib::timeout_add_local_once(Duration::from_millis(delay), move || {
+                if let Some(state) = weak.upgrade() { place(&state); }
+            });
+        }
+    });
     let (updates, mut signal) = match ipc::updates() {
         Ok(updates) => updates,
         Err(error) => { log(&format!("event notification: {error}")); app.quit(); return; }
@@ -178,6 +190,35 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
         let _ = &app_monitor;
         for dock in &state.borrow().docks { dock.name_window.close(); }
     });
+}
+
+fn place(state: &Shared) {
+    let Some(display) = gtk::gdk::Display::default() else { return; };
+    let monitors = display.monitors();
+    // Clone the windows first: showing one runs GTK handlers that borrow the state.
+    let docks: Vec<_> = state.borrow().docks.iter()
+        .map(|d| (d.output.clone(), d.window.clone(), d.name_window.clone())).collect();
+    for (output, window, name_window) in docks {
+        let monitor = (0..monitors.n_items()).filter_map(|n| monitors.item(n))
+            .filter_map(|m| m.downcast::<gtk::gdk::Monitor>().ok())
+            .find(|m| m.is_valid() && m.connector().as_deref() == Some(output.as_str()));
+        match monitor {
+            None if window.is_visible() => {
+                log(&format!("screen {output} gone, dock hidden"));
+                window.set_visible(false);
+                name_window.set_visible(false);
+            }
+            Some(monitor) if !window.is_visible() || window.monitor().as_ref() != Some(&monitor) => {
+                log(&format!("screen {output} back, dock shown"));
+                window.set_visible(false);
+                name_window.set_visible(false);
+                window.set_monitor(Some(&monitor));
+                name_window.set_monitor(Some(&monitor));
+                window.present();
+            }
+            _ => {}
+        }
+    }
 }
 
 fn load_css(css: &gtk::CssProvider, path: &std::path::Path) {
