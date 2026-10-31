@@ -85,9 +85,9 @@ mod imp {
             self.obj().snapshot_child(bar, snapshot);
             if let Some(shelf) = scene.shelf {
                 for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
-                    let actual = motion::Rect { y: rect.y - icon.bounce, ..*rect };
-                    let reflected = if icon.grid.is_some() { grid::reflection(actual) }
-                        else { motion::reflection(actual, shelf.y) };
+                    // Marc 10-31: no grid reflection; its mirrored dots read as running-app indicators.
+                    if icon.grid.is_some() { continue; }
+                    let reflected = motion::reflection(motion::Rect { y: rect.y - icon.bounce, ..*rect }, shelf.y);
                     let clip = gtk::graphene::Rect::new(reflected.visible.x as f32, reflected.visible.y as f32,
                         reflected.visible.width as f32, reflected.visible.height as f32);
                     let stops = reflected.stops.map(|(offset, alpha)| gtk::gsk::ColorStop::new(
