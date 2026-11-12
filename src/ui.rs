@@ -236,6 +236,11 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
             refresh(&state);
         }
     });
+    // Quit through GTK on SIGTERM/SIGINT so shutdown unlinks the control endpoint.
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let app = app.downgrade();
+        glib::source::unix_signal_add_local_once(signal, move || { if let Some(app) = app.upgrade() { app.quit(); } });
+    }
     app.connect_shutdown(move |_| {
         for watch in &watches { watch.cancel(); }
         let _ = &app_monitor;
