@@ -1,3 +1,4 @@
+pub mod autohide;
 pub mod desktop;
 pub mod ipc;
 pub mod motion;
