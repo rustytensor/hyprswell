@@ -2,7 +2,7 @@ use crate::{home_path, log, view::{DockView, Icon, Scene}};
 use gio::prelude::*;
 use gtk::prelude::*;
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
-use hyprswell::{desktop, grid, ipc, motion, pins, rules};
+use hyprswell::{autohide::{self, Zone}, control, desktop, grid, ipc, motion, pins, rules};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
@@ -33,6 +33,11 @@ struct Dock {
     last_tick: Instant,
     grid_animation: grid::Animation,
     grid_epoch: Instant,
+    autohide: autohide::Controller,
+    timer: Option<(f64, glib::SourceId)>,
+    zone: Option<i32>,
+    rest_bar: motion::Rect,
+    surface_height: f64,
 }
 
 struct State {
@@ -51,9 +56,19 @@ struct State {
     reflections_allowed: bool,
     launcher: grid::Position,
     refresh_icons: bool,
+    autohide: bool,
+    epoch: Instant,
+    acks: Vec<std::os::unix::net::UnixStream>,
+    ack_watch: bool,
+    endpoint: Option<control::Endpoint>,
 }
 
-pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflections_allowed: bool) {
+impl State {
+    fn clock(&self) -> f64 { self.epoch.elapsed().as_secs_f64() }
+}
+
+pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflections_allowed: bool,
+             control_path: Option<PathBuf>) {
     if !app.windows().is_empty() { return; }
     let Some(display) = gtk::gdk::Display::default() else { log("no GTK display"); return; };
     if !gtk4_layer_shell::is_supported() { log("Wayland layer shell is unavailable"); app.quit(); return; }
@@ -64,6 +79,7 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
     let size = rules::icon_size(&preferences);
     let reflections = rules::reflections_enabled(&preferences, reflections_allowed);
     let launcher = grid::position(&preferences);
+    let hide = autohide::enabled(&preferences);
     let css = gtk::CssProvider::new();
     let style_path = config.join("hyprswell/style.css");
     load_css(&css, &style_path);
@@ -105,12 +121,15 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
         docks.push(Dock { output: output.clone(), window, view, name_window, name_label, icons: vec![], hovered: None,
             pointer: None, scales: vec![], velocities: vec![], leaving: None, clicks: HashMap::new(),
             launches: HashMap::new(), rectangles: vec![], ticking: false, last_tick: Instant::now(),
-            grid_animation: grid::Animation::default(), grid_epoch: Instant::now() });
+            grid_animation: grid::Animation::default(), grid_epoch: Instant::now(),
+            autohide: autohide::Controller::new(hide, 0.0), timer: None, zone: None,
+            rest_bar: motion::Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }, surface_height: 0.0 });
     }
     if docks.is_empty() { log("no matching GTK screens, no dock"); app.quit(); return; }
     let state = Rc::new(RefCell::new(State { docks, snapshot: ipc::Snapshot::default(), pending: None,
         menu_count: 0, items: vec![], signature: vec![], pinned: pins::load(&pins_path).unwrap_or_default(),
-        pins_path, config_path, size, swell, reflections, reflections_allowed, launcher, refresh_icons: true }));
+        pins_path, config_path, size, swell, reflections, reflections_allowed, launcher, refresh_icons: true,
+        autohide: hide, epoch: Instant::now(), acks: vec![], ack_watch: false, endpoint: None }));
     for index in 0..state.borrow().docks.len() { connect_input(&state, index); }
     refresh(&state);
     let windows: Vec<_> = state.borrow().docks.iter().map(|dock| dock.window.clone()).collect();
@@ -144,13 +163,17 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
             }
         }
         let mut latest = None;
+        let mut attention = false;
         while let Ok(update) = updates.try_recv() {
             match update {
-                Ok(snapshot) => { latest = Some(snapshot); last_error.clear(); }
-                Err(error) if error != last_error => { log(&error); last_error = error; }
-                Err(_) => {}
+                ipc::Update::Attention => attention = true,
+                ipc::Update::Snapshot(Ok(snapshot)) => { latest = Some(snapshot); last_error.clear(); }
+                ipc::Update::Snapshot(Err(error)) if error != last_error => { log(&error); last_error = error; }
+                ipc::Update::Snapshot(Err(_)) => {}
             }
         }
+        // Attention reveals available docks; it never focuses or moves a window.
+        if attention { show_docks(&state, None); }
         if let Some(snapshot) = latest {
             let mut s = state.borrow_mut();
             if s.menu_count > 0 { s.pending = Some(snapshot); }
@@ -158,6 +181,29 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
         }
         glib::ControlFlow::Continue
     });
+    if let Some(path) = control_path {
+        match control::Server::bind(&path).and_then(control::Server::serve) {
+            Ok((requests, mut signal, endpoint)) => {
+                state.borrow_mut().endpoint = Some(endpoint);
+                let weak = Rc::downgrade(&state);
+                glib::source::unix_fd_add_local(signal.as_raw_fd(), glib::IOCondition::IN | glib::IOCondition::HUP, move |_, _| {
+                    let Some(state) = weak.upgrade() else { return glib::ControlFlow::Break; };
+                    let mut bytes = [0; 64];
+                    loop {
+                        match signal.read(&mut bytes) {
+                            Ok(0) => return glib::ControlFlow::Break,
+                            Ok(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => return glib::ControlFlow::Break,
+                        }
+                    }
+                    while let Ok(stream) = requests.try_recv() { show_docks(&state, Some(stream)); }
+                    glib::ControlFlow::Continue
+                });
+            }
+            Err(error) => log(&format!("control socket {}: {error}", path.display())),
+        }
+    }
     let mut watches = Vec::new();
     if let Ok(watch) = gio::File::for_path(&style_path).monitor_file(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE) {
         let weak = Rc::downgrade(&state);
@@ -193,7 +239,9 @@ pub fn start(app: &gtk::Application, outputs: &[String], swell: bool, reflection
     app.connect_shutdown(move |_| {
         for watch in &watches { watch.cancel(); }
         let _ = &app_monitor;
-        for dock in &state.borrow().docks { dock.name_window.close(); }
+        let mut s = state.borrow_mut();
+        drop(s.endpoint.take());
+        for dock in &s.docks { dock.name_window.close(); }
     });
 }
 
@@ -234,12 +282,18 @@ fn load_css(css: &gtk::CssProvider, path: &std::path::Path) {
 fn refresh(state: &Shared) {
     let mut s = state.borrow_mut();
     if s.menu_count > 0 { return; }
-    let (pinned, size, reflections, launcher) = if s.refresh_icons {
+    let (pinned, size, reflections, launcher, hide) = if s.refresh_icons {
         let preferences = std::fs::read_to_string(&s.config_path).unwrap_or_default();
         (pins::load(&s.pins_path).unwrap_or_else(|_| s.pinned.clone()),
          rules::icon_size(&preferences), rules::reflections_enabled(&preferences, s.reflections_allowed),
-         grid::position(&preferences))
-    } else { (s.pinned.clone(), s.size, s.reflections, s.launcher) };
+         grid::position(&preferences), autohide::enabled(&preferences))
+    } else { (s.pinned.clone(), s.size, s.reflections, s.launcher, s.autohide) };
+    // The Settings switch is applied live, without a restart that would unreserve and re-reserve.
+    if hide != s.autohide {
+        s.autohide = hide;
+        let now = s.clock();
+        for dock in &mut s.docks { dock.autohide.set_enabled(hide, now); }
+    }
     let items = grid::place_items(rules::items(&pinned, &s.snapshot.clients), launcher);
     let signature: Signature = items.iter().map(|item| (item.id.clone(), rules::indicator(&item.windows),
         item.windows.iter().any(|c| c.address == s.snapshot.active))).collect();
@@ -300,19 +354,6 @@ fn refresh(state: &Shared) {
     }
 }
 
-fn layout_config(size: u32, count: usize, apps: usize, reflections: bool) -> (motion::LayoutConfig, i32) {
-    let rest = rules::drawn_size(size, apps).max(1) as f64 * 0.8;
-    let bar_height = rest + 23.0;
-    let base_height = (rest * 2.2 + 36.0).ceil() as i32;
-    // Keep a fixed transparent surface; only the painted bar changes width.
-    let width = (count as f64 * rest * 1.8 + count.saturating_sub(1) as f64 * 8.0 + 20.0).ceil();
-    let config = motion::reflection_layout(motion::LayoutConfig {
-        surface_width: width, rest_width: rest, gap: 8.0, side_padding: 10.0,
-        bar_y: base_height as f64 - bar_height, bar_height, rest_bottom: base_height as f64 - 17.0,
-    }, reflections);
-    (config, base_height + motion::reflection_padding(rest, reflections) as i32 + 8)
-}
-
 fn begin_leave(dock: &mut Dock) {
     dock.leaving = Some((Instant::now(), dock.scales.iter().zip(&dock.velocities)
         .map(|(&value, &velocity)| motion::Spring::new(value, velocity, 1.0)).collect()));
@@ -339,13 +380,30 @@ fn frame(state: &Shared, index: usize) -> bool {
     let now = Instant::now();
     let mut s = state.borrow_mut();
     let reflections = s.reflections;
-    let (config, height) = layout_config(s.size, s.items.len(), grid::app_count(&s.items), reflections);
+    let (config, height) = autohide::dock_layout(s.size, s.items.len(), grid::app_count(&s.items), reflections);
     let ids: Vec<_> = s.items.iter().map(|item| item.id.clone()).collect();
     let grid_index = ids.iter().position(|id| id == "launcher");
     let swell = s.swell;
+    let hide = s.autohide;
+    let clock = s.clock();
+    let running = autohide::running(&s.items);
     let dock = &mut s.docks[index];
     let dt = now.duration_since(dock.last_tick).as_secs_f64().min(0.1);
     dock.last_tick = now;
+    dock.autohide.distance = autohide::hidden_offset(height as f64, config.bar_y);
+    dock.autohide.advance(clock);
+    let hidden = dock.autohide.settled_hidden();
+    if hidden {
+        // Nothing but the lip is visible: no invisible swell, grid or launch animation.
+        dock.pointer = None;
+        dock.hovered = None;
+        dock.leaving = None;
+        dock.clicks.clear();
+        dock.launches.clear();
+        dock.scales.fill(1.0);
+        dock.velocities.fill(0.0);
+        dock.grid_animation = grid::Animation::default();
+    }
     let mut active = false;
     if swell {
         if let Some((x, _)) = dock.pointer {
@@ -400,6 +458,21 @@ fn frame(state: &Shared, index: usize) -> bool {
             if Some(i) != grid_index { layout.icons[i].y -= 6.0; }
         }
     }
+    let rest = grid::layout(config, &vec![1.0; ids.len()], grid_index);
+    dock.rest_bar = rest.bar;
+    dock.surface_height = height as f64;
+    let mut shown_input = layout.input_region();
+    // Launch bounce also draws above the normal icon rectangle.
+    for (icon, rect) in dock.icons.iter().zip(&layout.icons) {
+        if icon.bounce > 0.0 { shown_input.push(motion::Rect { y: rect.y - icon.bounce, ..*rect }.outward()); }
+    }
+    let width = config.surface_width as i32;
+    let lip = autohide::lip_region(rest.bar, height as f64);
+    let input = dock.autohide.input_region(clock, &shown_input, lip, width, height);
+    // Drawing, hit tests and names all use the translated geometry while the dock moves.
+    let offset = dock.autohide.offset(clock);
+    let layout = autohide::translate(&layout, offset);
+    active |= dock.autohide.animating();
     let grid_hovered = grid_index.is_some_and(|i| dock.pointer.is_some_and(|(x, y)| {
         let r = layout.icons[i];
         x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
@@ -415,14 +488,104 @@ fn frame(state: &Shared, index: usize) -> bool {
         icon.shadow = swell && Some(i) != grid_index && dock.hovered.as_ref() == Some(&ids[i]);
     }
     dock.rectangles = layout.icons.clone();
-    let shelf = reflections.then(|| motion::shelf(&layout, config.rest_bottom, config.side_padding));
-    dock.window.set_exclusive_zone(config.bar_height.ceil() as i32 + 8);
-    dock.view.update(Scene { width: config.surface_width as i32, height, layout, shelf,
-        icons: dock.icons.clone(), indicator_y: config.rest_bottom + motion::reflection_padding(config.rest_width, reflections) + 6.0 });
+    let shelf = reflections.then(|| motion::shelf(&layout, config.rest_bottom + offset, config.side_padding));
+    // Set only when the required value changes; the slide never touches the reservation.
+    let zone = autohide::exclusive_zone(hide, config.bar_height);
+    if dock.zone != Some(zone) {
+        dock.window.set_exclusive_zone(zone);
+        dock.zone = Some(zone);
+    }
+    let lip_dots = if hidden { autohide::lip_dots(&rest, &running, height as f64) } else { vec![] };
+    dock.view.update(Scene { width, height, layout, shelf, input, hidden, lip_dots, icons: dock.icons.clone(),
+        indicator_y: config.rest_bottom + offset + motion::reflection_padding(config.rest_width, reflections) + 6.0 });
     update_name(&s, index);
+    let menu = s.menu_count > 0;
+    let dock = &mut s.docks[index];
+    let label = dock.name_window.is_visible();
+    dock.autohide.set_blockers(menu, label, clock);
+    active |= dock.autohide.animating();
     drop(s);
+    schedule(state, index);
     if control.launch { launch_launcher(); }
     active
+}
+
+/// One one-shot timer per dock for its next dwell or hide deadline; nothing polls while waiting.
+fn schedule(state: &Shared, index: usize) {
+    let mut s = state.borrow_mut();
+    let now = s.clock();
+    let dock = &mut s.docks[index];
+    let deadline = dock.autohide.next_deadline();
+    if dock.timer.as_ref().map(|(at, _)| *at) == deadline { return; }
+    if let Some((_, source)) = dock.timer.take() { source.remove(); }
+    let Some(at) = deadline else { return; };
+    let delay = Duration::from_micros(((at - now).max(0.0) * 1e6).ceil() as u64);
+    let weak = Rc::downgrade(state);
+    let source = glib::timeout_add_local_once(delay, move || {
+        let Some(state) = weak.upgrade() else { return; };
+        let moving = {
+            let mut s = state.borrow_mut();
+            let now = s.clock();
+            let dock = &mut s.docks[index];
+            dock.timer = None; // This source is finished; it must not be removed again.
+            dock.autohide.advance(now.max(at));
+            dock.autohide.animating()
+        };
+        schedule(&state, index);
+        if moving { wake(&state, index); }
+    });
+    dock.timer = Some((at, source));
+}
+
+/// The activation band counts only while it takes input, and only under the rest bar's span.
+fn zone_at(dock: &Dock, x: f64, y: f64) -> Zone {
+    let bar = dock.rest_bar;
+    let band = dock.autohide.band_input() && y >= dock.surface_height - autohide::LIP
+        && x >= bar.x && x < bar.x + bar.width;
+    if band { Zone::Band } else { Zone::Dock }
+}
+
+/// Keyboard, control socket and attention requests reveal every available dock; asleep outputs stay hidden.
+fn show_docks(state: &Shared, ack: Option<std::os::unix::net::UnixStream>) {
+    let visible: Vec<usize> = {
+        let mut s = state.borrow_mut();
+        let now = s.clock();
+        let visible: Vec<_> = (0..s.docks.len()).filter(|&i| s.docks[i].window.is_visible()).collect();
+        for &i in &visible { s.docks[i].autohide.show(now); }
+        if let Some(stream) = ack { s.acks.push(stream); }
+        visible
+    };
+    for &i in &visible { schedule(state, i); wake(state, i); }
+    let Some(&first) = visible.first() else { reply(state, "none"); return; };
+    if state.borrow().acks.is_empty() { return; }
+    if std::mem::replace(&mut state.borrow_mut().ack_watch, true) { return; }
+    // Acknowledge after a frame has been painted with every available dock settled shown.
+    let view = state.borrow().docks[first].view.clone();
+    let weak = Rc::downgrade(state);
+    let started = Instant::now();
+    let settled = std::cell::Cell::new(0);
+    view.add_tick_callback(move |_, _| {
+        let Some(state) = weak.upgrade() else { return glib::ControlFlow::Break; };
+        let all = {
+            let s = state.borrow();
+            s.docks.iter().filter(|d| d.window.is_visible()).all(|d| d.autohide.settled_shown())
+        };
+        settled.set(if all { settled.get() + 1 } else { 0 });
+        let timeout = started.elapsed() > Duration::from_secs(3);
+        if settled.get() < 2 && !timeout { return glib::ControlFlow::Continue; }
+        state.borrow_mut().ack_watch = false;
+        reply(&state, if timeout { "timeout" } else { control::SHOWN });
+        glib::ControlFlow::Break
+    });
+}
+
+fn reply(state: &Shared, text: &str) {
+    let acks = std::mem::take(&mut state.borrow_mut().acks);
+    for mut stream in acks {
+        use std::io::Write;
+        let _ = stream.set_nonblocking(true);
+        let _ = stream.write_all(format!("{text}\n").as_bytes());
+    }
 }
 
 fn hit(dock: &Dock, x: f64, y: f64) -> Option<usize> {
@@ -446,16 +609,22 @@ fn connect_input(state: &Shared, index: usize) {
     let weak = Rc::downgrade(state);
     controller.connect_leave(move |_| {
         if let Some(state) = weak.upgrade() {
-            {
+            let quiet = {
                 let mut s = state.borrow_mut();
+                let now = s.clock();
+                let menu = s.menu_count > 0;
                 let dock = &mut s.docks[index];
                 dock.pointer = None;
                 dock.hovered = None;
                 dock.grid_animation.set_hover(false, dock.grid_epoch.elapsed().as_secs_f64());
                 dock.name_window.set_visible(false);
                 begin_leave(dock);
-            }
-            wake(&state, index);
+                dock.autohide.set_blockers(menu, false, now);
+                dock.autohide.pointer(Zone::Outside, now);
+                dock.autohide.settled_hidden()
+            };
+            schedule(&state, index);
+            if !quiet { wake(&state, index); }
         }
     });
     view.add_controller(controller);
@@ -465,6 +634,8 @@ fn connect_input(state: &Shared, index: usize) {
     click.connect_pressed(move |gesture, _, x, y| {
         if let Some(state) = weak.upgrade() {
             let mut s = state.borrow_mut();
+            // The activation band only reveals: it never launches, focuses or minimizes.
+            if zone_at(&s.docks[index], x, y) == Zone::Band || s.docks[index].autohide.settled_hidden() { return; }
             if let Some(i) = hit(&s.docks[index], x, y) {
                 let id = s.items[i].id.clone();
                 if id == "launcher" {
@@ -482,7 +653,8 @@ fn connect_input(state: &Shared, index: usize) {
     click.connect_released(move |click, _, x, y| {
         if let Some(state) = weak.upgrade() {
             let mut s = state.borrow_mut();
-            let hit_index = hit(&s.docks[index], x, y);
+            let band = zone_at(&s.docks[index], x, y) == Zone::Band || s.docks[index].autohide.settled_hidden();
+            let hit_index = if band { None } else { hit(&s.docks[index], x, y) };
             if s.docks[index].grid_animation.is_pressed() {
                 let activate = hit_index.is_some_and(|i| s.items[i].id == "launcher")
                     && matches!(click.current_button(), 1 | 2);
@@ -527,13 +699,24 @@ fn cancel_grid(state: &Shared, index: usize) {
 
 fn pointer(state: &Shared, index: usize, x: f64, y: f64) {
     let mut s = state.borrow_mut();
-    let hovered = hit(&s.docks[index], x, y).map(|i| s.items[i].id.clone());
+    let now = s.clock();
+    let zone = zone_at(&s.docks[index], x, y);
+    // A held activation band feeds no position into icon or grid hover.
+    let hovered = if zone == Zone::Band { None } else { hit(&s.docks[index], x, y).map(|i| s.items[i].id.clone()) };
     let dock = &mut s.docks[index];
+    let was_hidden = dock.autohide.settled_hidden();
+    dock.autohide.pointer(zone, now);
+    let quiet = was_hidden && dock.autohide.settled_hidden();
+    if zone == Zone::Band {
+        if dock.pointer.is_some() { begin_leave(dock); }
+        dock.pointer = None;
+    } else { dock.pointer = Some((x, y)); }
     dock.grid_animation.set_hover(hovered.as_deref() == Some("launcher"), dock.grid_epoch.elapsed().as_secs_f64());
-    dock.pointer = Some((x, y));
     dock.hovered = hovered;
     drop(s);
-    wake(state, index);
+    schedule(state, index);
+    // No frame work during the dwell itself: the hidden dock looks the same until its timer fires.
+    if !quiet { wake(state, index); }
 }
 
 fn update_name(s: &State, index: usize) {
@@ -566,6 +749,8 @@ fn popover(state: &Shared, index: usize, item: usize) -> (gtk::Popover, gtk::Box
     {
         let mut s = state.borrow_mut();
         s.menu_count += 1;
+        let now = s.clock();
+        for dock in &mut s.docks { dock.autohide.set_blockers(true, false, now); }
         let dock = &s.docks[index];
         let rect = dock.rectangles[item].outward();
         menu.set_parent(&dock.view);
@@ -585,7 +770,14 @@ fn popover(state: &Shared, index: usize, item: usize) -> (gtk::Popover, gtk::Box
                 if s.menu_count == 0 {
                     if let Some(snapshot) = s.pending.take() { s.snapshot = snapshot; }
                 }
+                let (now, menu) = (s.clock(), s.menu_count > 0);
+                for dock in &mut s.docks {
+                    let label = dock.name_window.is_visible();
+                    dock.autohide.set_blockers(menu, label, now);
+                }
             }
+            let count = state.borrow().docks.len();
+            for i in 0..count { schedule(&state, i); }
             refresh(&state);
         }
     });

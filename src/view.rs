@@ -1,6 +1,6 @@
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use hyprswell::{grid, motion, rules};
+use hyprswell::{autohide, grid, motion, rules};
 use std::cell::RefCell;
 
 #[derive(Clone)]
@@ -21,6 +21,11 @@ pub struct Scene {
     pub icons: Vec<Icon>,
     pub indicator_y: f64,
     pub shelf: Option<motion::Rect>,
+    /// Final surface input, already translated and clipped by the caller.
+    pub input: Vec<motion::InputRect>,
+    /// Settled hidden: draw only the bar's top edge and these running-app dots.
+    pub hidden: bool,
+    pub lip_dots: Vec<(f64, f64)>,
 }
 
 mod imp {
@@ -58,12 +63,12 @@ mod imp {
             allocate_style(self.bar_style.borrow().as_ref().unwrap(), scene.layout.bar);
             let shelf = self.shelf_style.borrow();
             let shelf = shelf.as_ref().unwrap();
-            shelf.set_child_visible(scene.shelf.is_some());
+            shelf.set_child_visible(scene.shelf.is_some() && !scene.hidden);
             if let Some(rect) = scene.shelf { allocate_style(shelf, rect); }
             let active = self.active_style.borrow();
             let active = active.as_ref().unwrap();
             let icon = scene.icons.iter().zip(&scene.layout.icons).find(|(icon, _)| icon.active);
-            active.set_child_visible(icon.is_some());
+            active.set_child_visible(icon.is_some() && !scene.hidden);
             if let Some((_, rect)) = icon {
                 allocate_style(active, motion::Rect {
                     x: rect.x + rect.width / 2.0 - 10.0, y: scene.indicator_y + 4.0,
@@ -83,6 +88,16 @@ mod imp {
             let bar = styles.as_ref().unwrap();
             let accent = self.indicator_style.borrow().as_ref().unwrap().color();
             self.obj().snapshot_child(bar, snapshot);
+            if scene.hidden {
+                let cr = snapshot.append_cairo(&gtk::graphene::Rect::new(0.0, 0.0, scene.width as f32, scene.height as f32));
+                cr.set_source_rgba(accent.red() as f64, accent.green() as f64, accent.blue() as f64, accent.alpha() as f64);
+                for &(x, y) in &scene.lip_dots {
+                    cr.new_sub_path();
+                    cr.arc(x, y, autohide::DOT_RADIUS, 0.0, std::f64::consts::TAU);
+                    let _ = cr.fill();
+                }
+                return;
+            }
             if let Some(shelf) = scene.shelf {
                 for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
                     // Marc 10-31: no grid reflection; its mirrored dots read as running-app indicators.
@@ -209,15 +224,8 @@ impl DockView {
         let resize = self.imp().scene.borrow().as_ref()
             .is_none_or(|old| old.width != scene.width || old.height != scene.height);
         let region = gtk::cairo::Region::create();
-        for rect in scene.layout.input_region() {
+        for rect in &scene.input {
             let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(rect.x, rect.y, rect.width, rect.height));
-        }
-        // Launch bounce also draws above the normal icon rectangle.
-        for (icon, rect) in scene.icons.iter().zip(&scene.layout.icons) {
-            if icon.bounce > 0.0 {
-                let rect = motion::Rect { y: rect.y - icon.bounce, ..*rect }.outward();
-                let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(rect.x, rect.y, rect.width, rect.height));
-            }
         }
         if let Some(surface) = self.native().and_then(|native| native.surface()) {
             surface.set_input_region(&region);

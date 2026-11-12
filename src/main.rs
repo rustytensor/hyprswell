@@ -2,7 +2,7 @@ mod ui;
 mod view;
 
 use gtk::prelude::*;
-use hyprswell::{ipc, rules};
+use hyprswell::{control, ipc, rules};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -25,6 +25,8 @@ fn main() {
     let mut output = None;
     let mut swell = true;
     let mut reflections_allowed = true;
+    let mut show = false;
+    let mut control_socket = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -34,8 +36,30 @@ fn main() {
             }
             "--no-swell" => swell = false,
             "--no-reflections" => reflections_allowed = false,
-            "--help" | "-h" => { println!("hyprswell [--output NAME] [--no-swell] [--no-reflections]"); return; }
+            "--show" => show = true,
+            "--control-socket" => {
+                control_socket = args.next().map(PathBuf::from);
+                if control_socket.is_none() { eprintln!("--control-socket needs a path"); std::process::exit(2); }
+            }
+            "--help" | "-h" => {
+                println!("hyprswell [--output NAME] [--no-swell] [--no-reflections] [--control-socket PATH]\n\
+                          hyprswell --show [--control-socket PATH]   reveal the running dock; never starts one");
+                return;
+            }
             _ => { eprintln!("unknown argument: {arg}"); std::process::exit(2); }
+        }
+    }
+    let control_path = match control_socket.map_or_else(control::default_path, Ok) {
+        Ok(path) => Some(path),
+        Err(error) if show => { eprintln!("hyprswell --show: {error}"); std::process::exit(1); }
+        Err(error) => { log(&format!("no control socket: {error}")); None }
+    };
+    if show {
+        let path = control_path.expect("checked above");
+        match control::request_show(&path, Duration::from_secs(5)) {
+            Ok(reply) if reply == control::SHOWN => return,
+            Ok(reply) => { eprintln!("hyprswell --show: dock replied {reply:?}"); std::process::exit(1); }
+            Err(error) => { eprintln!("hyprswell --show: {error}"); std::process::exit(1); }
         }
     }
     let config = home_path("XDG_CONFIG_HOME", ".config").join("nwg-dock-hyprland/hyprswell.conf");
@@ -66,6 +90,6 @@ fn main() {
     };
     let app = gtk::Application::builder().application_id("org.hyprswell.Dock")
         .flags(gio::ApplicationFlags::NON_UNIQUE).build();
-    app.connect_activate(move |app| ui::start(app, &selected, swell, reflections_allowed));
+    app.connect_activate(move |app| ui::start(app, &selected, swell, reflections_allowed, control_path.clone()));
     app.run_with_args::<&str>(&[]);
 }
