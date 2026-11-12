@@ -1,4 +1,5 @@
 pub mod autohide;
+pub mod control;
 pub mod desktop;
 pub mod ipc;
 pub mod motion;
